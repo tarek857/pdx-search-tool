@@ -116,3 +116,7 @@ Write output to a file:
 - `--dids`: Print DID candidates.
 
 If no report mode is selected, the tool prints the full report.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
