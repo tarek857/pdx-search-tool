@@ -18,7 +18,7 @@
 namespace
 {
 constexpr std::string_view usage =
-    "Usage: pdx-search-tool [--summary|--services|--dtcs|--dids] [--search <text>] [--find-value <text>] [--interactive] [--context <lines>] [--output <report.txt>] --pdx-file <file.pdx|folder|file.odx>";
+    "Usage: pdx-search-tool [--summary|--services|--dtcs|--dids] [--search <text>] [--find-value <text>] [--mosdon-config] [--interactive] [--context <lines>] [--output <report.txt>] --pdx-file <file.pdx|folder|file.odx>";
 
 struct ReportModeFlags
 {
@@ -92,6 +92,15 @@ void addOptions(CommandLineParser &parser,
     parser.addOption(Option{{"--output", "-o"}, &options.output, "Write report to a file"});
     parser.addOption(Option{{"--search"}, &options.searchQuery, "Search raw ODX/XML text"});
     parser.addOption(Option{{"--find-value", "--value"}, &valueQueryTexts, "Find value request/response/formula; can be repeated"});
+    parser.addOption(Option{{"--mosdon-config"}, &options.mosdonConfigOutput, "Emit Mosdon vehicle config JSON for --find-value matches"});
+    parser.addOption(Option{{"--vehicle-manufacturer"}, &options.mosdonConfig.manufacturer, "Mosdon config vehicle manufacturer"});
+    parser.addOption(Option{{"--vehicle-model"}, &options.mosdonConfig.model, "Mosdon config vehicle model"});
+    parser.addOption(Option{{"--vehicle-version"}, &options.mosdonConfig.version, "Mosdon config vehicle version"});
+    parser.addOption(Option{{"--fuel-tank-capacity"}, &options.mosdonConfig.fuelTankCapacityLiters, "Mosdon config fuel_tank_capacity_liters"});
+    parser.addOption(Option{{"--uds-sender-id"}, Option::integerVariant{&options.mosdonConfig.udsSenderId}, "Default UDS request CAN ID"});
+    parser.addOption(Option{{"--uds-receiver-id"}, Option::integerVariant{&options.mosdonConfig.udsReceiverId}, "Default UDS response CAN ID"});
+    parser.addOption(Option{{"--dashboard-sender-id"}, Option::integerVariant{&options.mosdonConfig.dashboardSenderId}, "Dashboard UDS request CAN ID"});
+    parser.addOption(Option{{"--dashboard-receiver-id"}, Option::integerVariant{&options.mosdonConfig.dashboardReceiverId}, "Dashboard UDS response CAN ID"});
     parser.addOption(Option{{"--interactive"}, &options.interactive, "Choose one structured value match interactively"});
     parser.addOption(Option{{"--context"}, Option::integerVariant{&options.contextLines}, "Raw search context lines"});
     parser.addOption(Option{{"--summary"}, &modeFlags.summary, "Print package summary"});
@@ -153,6 +162,16 @@ ParseResult parseCommandLine(int argc, char **argv, std::ostream &out, std::ostr
     if (options.interactive && !options.output.empty())
     {
         err << "--interactive cannot be used with --output\n";
+        return ParseResult{options, false, 2};
+    }
+    if (options.mosdonConfigOutput && options.valueQueries.empty())
+    {
+        err << "--mosdon-config requires at least one --find-value query\n";
+        return ParseResult{options, false, 2};
+    }
+    if (options.mosdonConfigOutput && options.interactive)
+    {
+        err << "--mosdon-config cannot be used with --interactive\n";
         return ParseResult{options, false, 2};
     }
 
@@ -247,6 +266,11 @@ void writeRequestedOutput(std::istream &in, std::ostream &out, const ProgramOpti
     if (!options.valueQueries.empty())
     {
         const auto documents = loader.loadRawDocuments(options.pdxFile);
+        if (options.mosdonConfigOutput)
+        {
+            pdxinfo::writeMosdonConfig(out, documents, options.valueQueries, options.mosdonConfig);
+            return;
+        }
         if (options.interactive)
         {
             pdxinfo::writeInteractiveValueFindings(in, out, documents, options.valueQueries);

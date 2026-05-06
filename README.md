@@ -89,6 +89,12 @@ Find value information:
 ./build/pdx-search-tool --find-value "VehicleSpeed" --pdx-file path/to/package.pdx
 ```
 
+Generate Mosdon vehicle config JSON for matching values:
+
+```bash
+./build/pdx-search-tool --pdx-file path/to/package.pdx --find-value "Mileage" --mosdon-config --vehicle-manufacturer Audi --vehicle-model "A3 2016" --fuel-tank-capacity 50 --output test.json
+```
+
 Run value search interactively:
 
 ```bash
@@ -108,6 +114,13 @@ Write output to a file:
 - `--output <file>`, `-o <file>`: Write the report to a file.
 - `--search <text>`: Search raw ODX/XML text.
 - `--find-value <text>`, `--value <text>`: Find value request, response, or formula information. This option can be repeated.
+- `--mosdon-config`: Emit Mosdon `vehicle/can/protocols/signals` JSON for `--find-value` matches.
+- `--vehicle-manufacturer <name>`: Vehicle manufacturer for `--mosdon-config`.
+- `--vehicle-model <name>`: Vehicle model for `--mosdon-config`.
+- `--vehicle-version <version>`: Vehicle config version for `--mosdon-config`.
+- `--fuel-tank-capacity <liters>`: `fuel_tank_capacity_liters` value for `--mosdon-config`.
+- `--uds-sender-id <id>`, `--uds-receiver-id <id>`: Default UDS CAN IDs for generated config signals.
+- `--dashboard-sender-id <id>`, `--dashboard-receiver-id <id>`: Dashboard UDS CAN IDs for generated config signals.
 - `--interactive`: Choose one structured value match interactively. Requires `--find-value`.
 - `--context <lines>`: Number of context lines for raw text search. Default is `2`.
 - `--summary`: Print package summary.

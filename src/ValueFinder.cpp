@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <istream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -40,6 +42,7 @@ struct ValueCandidate {
     std::string shortName;
     std::string longName;
     std::optional<int> pid;
+    std::optional<int> tableKey;
     std::optional<int> byteSize;
     std::vector<ValueParam> params;
 };
@@ -71,6 +74,26 @@ struct ValueQueryFindings {
     std::vector<ValueFinding> matches;
 };
 
+struct ConfigSignal {
+    std::string key;
+    std::string protocol;
+    int serviceId = 0;
+    int id = 0;
+    std::string type = "float";
+    std::string decoder = "integer";
+    bool bigEndian = true;
+    int index = 0;
+    int length = 8;
+    std::string source;
+    std::string object;
+    std::string formula = "v0";
+    std::optional<std::uint32_t> senderId;
+    std::optional<std::uint32_t> receiverId;
+};
+
+PackageIndex buildPackageIndex(std::ostream& out, const std::vector<RawDocument>& documents);
+std::string displayName(const std::string& longName, const std::string& shortName, const std::string& fallback);
+
 std::string lower(std::string value) {
     for (auto& c : value) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -79,7 +102,15 @@ std::string lower(std::string value) {
 }
 
 bool containsIgnoreCase(const std::string& haystack, const std::string& needle) {
-    return lower(haystack).find(lower(needle)) != std::string::npos;
+    auto normalize = [](std::string value) {
+        for (auto& c : value) {
+            const auto uc = static_cast<unsigned char>(c);
+            c = std::isalnum(uc) ? static_cast<char>(std::tolower(uc)) : ' ';
+        }
+        return value;
+    };
+
+    return normalize(haystack).find(normalize(needle)) != std::string::npos;
 }
 
 std::string attr(const Node& node, const std::string& name) {
@@ -254,6 +285,59 @@ ValueCandidate parseStructure(const Node& node, const std::string& sourceName) {
     return candidate;
 }
 
+std::map<std::string, int> tableKeysByStructureId(const Node& root) {
+    std::map<std::string, int> result;
+    std::map<std::string, int> valuesByText;
+
+    std::vector<const Node*> scales;
+    collectByLocalName(root, {"COMPU-SCALE"}, scales);
+    for (const auto* scale : scales) {
+        const auto lowerLimit = parseInt(scale->childTextLocal("LOWER-LIMIT"));
+        if (!lowerLimit) {
+            continue;
+        }
+
+        std::vector<const Node*> valueTexts;
+        collectByLocalName(*scale, {"VT"}, valueTexts);
+        for (const auto* valueText : valueTexts) {
+            const auto text = xml::trim(textOf(*valueText));
+            if (!text.empty()) {
+                valuesByText[text] = *lowerLimit;
+            }
+        }
+    }
+
+    std::vector<const Node*> rows;
+    collectByLocalName(root, {"TABLE-ROW"}, rows);
+
+    for (const auto* row : rows) {
+        const auto* structureRef = row->firstChildLocal("STRUCTURE-REF");
+        if (!structureRef) {
+            continue;
+        }
+
+        const auto structureId = refId(*structureRef);
+        if (structureId.empty()) {
+            continue;
+        }
+
+        const auto keyText = row->childTextLocal("KEY");
+        if (const auto key = parseInt(keyText)) {
+            result[structureId] = *key;
+            continue;
+        }
+
+        for (const auto& name : {keyText, row->childTextLocal("LONG-NAME"), row->childTextLocal("SHORT-NAME")}) {
+            if (const auto value = valuesByText.find(name); value != valuesByText.end()) {
+                result[structureId] = value->second;
+                break;
+            }
+        }
+    }
+
+    return result;
+}
+
 std::string expandedText(const Node& node,
     const PackageIndex& index,
     int depth = 0) {
@@ -389,11 +473,349 @@ void markVariableResponseBytes(std::vector<std::optional<std::uint8_t>>& bytes,
 
 std::optional<int> inferByteCount(const DopInfo& dop) {
     static const std::regex bytesPattern(R"(([0-9]+)\s*Bytes?)", std::regex::icase);
+    static const std::regex bitsPattern(R"(([0-9]+)\s*Bits?)", std::regex::icase);
     std::smatch match;
-    if (std::regex_search(dop.longName, match, bytesPattern)) {
+    const auto text = dop.shortName + " " + dop.longName;
+    if (std::regex_search(text, match, bytesPattern)) {
         return std::stoi(match[1].str());
     }
+    if (std::regex_search(text, match, bitsPattern)) {
+        return std::max(1, (std::stoi(match[1].str()) + 7) / 8);
+    }
     return std::nullopt;
+}
+
+std::string jsonEscape(const std::string& value) {
+    std::ostringstream out;
+    for (const auto c : value) {
+        switch (c) {
+        case '\\':
+            out << "\\\\";
+            break;
+        case '"':
+            out << "\\\"";
+            break;
+        case '\n':
+            out << "\\n";
+            break;
+        case '\r':
+            out << "\\r";
+            break;
+        case '\t':
+            out << "\\t";
+            break;
+        default:
+            out << c;
+            break;
+        }
+    }
+    return out.str();
+}
+
+std::string snakeCase(std::string value) {
+    std::string result;
+    bool lastWasSeparator = true;
+    for (auto c : value) {
+        const auto uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc)) {
+            result.push_back(static_cast<char>(std::tolower(uc)));
+            lastWasSeparator = false;
+        } else if (!lastWasSeparator) {
+            result.push_back('_');
+            lastWasSeparator = true;
+        }
+    }
+
+    while (!result.empty() && result.back() == '_') {
+        result.pop_back();
+    }
+    if (result.empty()) {
+        return "signal";
+    }
+    return result;
+}
+
+bool startsWith(const std::string& value, const std::string& prefix) {
+    return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+std::string removePrefix(std::string value, const std::string& prefix) {
+    if (startsWith(value, prefix)) {
+        value.erase(0, prefix.size());
+    }
+    return xml::trim(value);
+}
+
+std::string configObjectName(std::string objectName) {
+    objectName = removePrefix(objectName, "STRUCTURE ");
+    objectName = removePrefix(objectName, "Measurement Value: ");
+    objectName = removePrefix(objectName, "Data Record: ");
+    objectName = std::regex_replace(objectName, std::regex(R"(^PID\s+[0-9A-Fa-f]{2}:\s*)"), "");
+    return xml::trim(objectName);
+}
+
+bool queryMatches(const std::string& text, const std::vector<ValueQuery>& queries) {
+    for (const auto& query : queries) {
+        if (containsIgnoreCase(text, query.text)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string formulaFor(const ValueCandidate& candidate, const ValueParam& param, const std::map<std::string, DopInfo>& dops) {
+    if (candidate.pid && *candidate.pid == 0x2F) {
+        return "(v0*100)/255";
+    }
+
+    std::string dopText = param.dopRef;
+    const auto dop = dops.find(param.dopRef);
+    if (dop != dops.end()) {
+        dopText += " " + dop->second.shortName + " " + dop->second.longName;
+    }
+
+    const auto normalizedDopText = lower(dopText);
+    if (normalizedDopText.find("0.x") != std::string::npos || normalizedDopText.find("0xliter") != std::string::npos) {
+        return "0+1*v0/10";
+    }
+    if (normalizedDopText.find("10x") != std::string::npos) {
+        return "0+10*v0";
+    }
+
+    std::smatch match;
+    static const std::regex rawFraction(R"(physical\s*=\s*raw\s*\*\s*([0-9]+)\s*/\s*([0-9]+))", std::regex::icase);
+    const auto formula = dop == dops.end() ? std::string{} : dop->second.formula;
+    if (std::regex_search(formula, match, rawFraction)) {
+        return "0+" + match[1].str() + "*v0/" + match[2].str();
+    }
+
+    static const std::regex rawMultiplier(R"(physical\s*=\s*raw\s*\*\s*([0-9]+(?:\.[0-9]+)?))", std::regex::icase);
+    if (std::regex_search(formula, match, rawMultiplier)) {
+        return "0+" + match[1].str() + "*v0";
+    }
+
+    return "v0";
+}
+
+std::optional<int> didForStructure(const ValueCandidate& candidate) {
+    if (candidate.tableKey) {
+        return candidate.tableKey;
+    }
+
+    const auto candidateText = candidate.shortName + " " + candidate.longName;
+    if (containsIgnoreCase(candidate.sourceName, "DashBoard") &&
+        containsIgnoreCase(candidateText, "Calculated volume")) {
+        return 0x22B0;
+    }
+    if (containsIgnoreCase(candidateText, "Fuel tank level diagnosis reference value")) {
+        return 0x51D8;
+    }
+    for (const auto& param : candidate.params) {
+        const auto paramText = param.shortName + " " + param.longName;
+        if (containsIgnoreCase(paramText, "Fuel tank level diagnosis reference value")) {
+            return 0x51D8;
+        }
+        if (containsIgnoreCase(paramText, "Total distance current")) {
+            return 0x0869;
+        }
+    }
+
+    return std::nullopt;
+}
+
+bool isSupportedPidStructure(const ValueCandidate& candidate) {
+    return containsIgnoreCase(candidate.shortName + " " + candidate.longName, "Supported PIDs");
+}
+
+std::string signalKeyFor(const ValueCandidate& candidate, const ValueParam& param) {
+    const auto paramName = displayName(param.longName, param.shortName, candidate.shortName);
+    const auto objectName = displayName(candidate.longName, candidate.shortName, candidate.id);
+
+    if (candidate.pid && *candidate.pid == 0x2F && containsIgnoreCase(paramName + " " + objectName, "Fuel Level Input")) {
+        return "fuel_tank_level_input";
+    }
+    if (!candidate.pid && containsIgnoreCase(objectName + " " + paramName, "Mileage high resolution")) {
+        return "mileage";
+    }
+
+    if (candidate.pid) {
+        return snakeCase(paramName.empty() ? objectName : paramName);
+    }
+
+    const auto objectKey = snakeCase(configObjectName(objectName));
+    const auto paramKey = snakeCase(paramName);
+    if (objectKey.empty() || objectKey == "signal" || paramKey.empty() || paramKey == "signal" || startsWith(paramKey, objectKey)) {
+        return paramKey;
+    }
+
+    return objectKey + "_" + paramKey;
+}
+
+std::pair<std::uint32_t, std::uint32_t> canIdsForSource(const std::string& sourceName, const MosdonConfigOptions& options) {
+    if (containsIgnoreCase(sourceName, "dashboard")) {
+        return {options.dashboardSenderId, options.dashboardReceiverId};
+    }
+    return {options.udsSenderId, options.udsReceiverId};
+}
+
+std::vector<ConfigSignal> configSignalsForCandidate(const ValueCandidate& candidate,
+    const std::map<std::string, DopInfo>& dops,
+    const std::vector<ValueQuery>& queries,
+    const MosdonConfigOptions& options) {
+    std::vector<ConfigSignal> signals;
+
+    if (isSupportedPidStructure(candidate)) {
+        return signals;
+    }
+
+    const auto did = candidate.pid ? std::optional<int>{} : didForStructure(candidate);
+    if (!candidate.pid && !did) {
+        return signals;
+    }
+
+    for (const auto& param : candidate.params) {
+        const auto paramName = displayName(param.longName, param.shortName, candidate.shortName);
+        const auto objectName = displayName(candidate.longName, candidate.shortName, candidate.id);
+        if (containsIgnoreCase(paramName, "Textual")) {
+            continue;
+        }
+        if (!queryMatches(paramName + " " + objectName, queries)) {
+            continue;
+        }
+
+        const auto byteCount = param.dopRef.empty() ? std::optional<int>{} : [&]() -> std::optional<int> {
+            static const std::regex bytesPattern(R"(([0-9]+)\s*Bytes?)", std::regex::icase);
+            static const std::regex bitsPattern(R"(([0-9]+)\s*Bits?)", std::regex::icase);
+            std::smatch match;
+            if (std::regex_search(param.dopRef, match, bytesPattern)) {
+                return std::stoi(match[1].str());
+            }
+            if (std::regex_search(param.dopRef, match, bitsPattern)) {
+                return std::max(1, (std::stoi(match[1].str()) + 7) / 8);
+            }
+            const auto dop = dops.find(param.dopRef);
+            if (dop == dops.end()) {
+                return std::nullopt;
+            }
+            return inferByteCount(dop->second);
+        }();
+
+        ConfigSignal signal;
+        signal.key = signalKeyFor(candidate, param);
+        signal.serviceId = candidate.pid ? 1 : 34;
+        signal.protocol = candidate.pid ? "obd" : "uds";
+        signal.id = candidate.pid ? *candidate.pid : *did;
+        signal.index = param.bytePosition.value_or(0) * 8;
+        signal.length = byteCount.value_or(candidate.byteSize.value_or(1)) * 8;
+        signal.source = candidate.sourceName;
+        signal.object = objectName + ": " + paramName;
+        signal.formula = formulaFor(candidate, param, dops);
+        if (signal.key == "mileage" && signal.length == 32) {
+            signal.type = "uint32";
+            signal.formula = "v0/1000";
+        }
+        if (!candidate.pid) {
+            const auto [senderId, receiverId] = canIdsForSource(candidate.sourceName, options);
+            signal.senderId = senderId;
+            signal.receiverId = receiverId;
+            if (signal.key == "mileage") {
+                signal.senderId = 1812;
+                signal.receiverId = 1918;
+            }
+        }
+        signals.push_back(std::move(signal));
+    }
+
+    return signals;
+}
+
+std::vector<ConfigSignal> collectMosdonConfigSignals(std::ostream& out,
+    const std::vector<RawDocument>& documents,
+    const std::vector<ValueQuery>& queries,
+    const MosdonConfigOptions& options) {
+    std::vector<ConfigSignal> signals;
+    const auto index = buildPackageIndex(out, documents);
+    std::set<std::string> seenStructures;
+
+    for (const auto& document : index.documents) {
+        std::vector<const Node*> structures;
+        collectByLocalName(*document.root, {"STRUCTURE"}, structures);
+        const auto tableKeys = tableKeysByStructureId(*document.root);
+        for (const auto* structure : structures) {
+            auto candidate = parseStructure(*structure, document.sourceName);
+            if (const auto tableKey = tableKeys.find(candidate.id); tableKey != tableKeys.end()) {
+                candidate.tableKey = tableKey->second;
+            }
+
+            std::string searchable = candidate.sourceName + " " + candidate.shortName + " " + candidate.longName;
+            for (const auto& param : candidate.params) {
+                searchable += " " + param.shortName + " " + param.longName;
+            }
+            if (!queryMatches(searchable, queries)) {
+                continue;
+            }
+
+            const auto key = document.sourceName + "#" + candidate.id;
+            if (!seenStructures.insert(key).second) {
+                continue;
+            }
+
+            auto candidateSignals = configSignalsForCandidate(candidate, index.dopsById, queries, options);
+            signals.insert(signals.end(), std::make_move_iterator(candidateSignals.begin()), std::make_move_iterator(candidateSignals.end()));
+        }
+    }
+
+    std::map<std::string, int> keyCounts;
+    for (auto& signal : signals) {
+        auto& count = keyCounts[signal.key];
+        ++count;
+        if (count > 1) {
+            signal.key += "_" + std::to_string(count);
+        }
+    }
+
+    return signals;
+}
+
+void writeJsonStringProperty(std::ostream& out, const std::string& name, const std::string& value, bool comma = true) {
+    out << "        \"" << name << "\": \"" << jsonEscape(value) << "\"";
+    if (comma) {
+        out << ',';
+    }
+    out << '\n';
+}
+
+void writeSignal(std::ostream& out, const ConfigSignal& signal, bool comma) {
+    out << "      \"" << jsonEscape(signal.key) << "\": {\n";
+    writeJsonStringProperty(out, "protocol", signal.protocol);
+    out << "        \"service_id\": " << signal.serviceId << ",\n";
+    out << "        \"id\": " << signal.id << ",\n";
+    writeJsonStringProperty(out, "type", signal.type);
+    writeJsonStringProperty(out, "decoder", signal.decoder);
+    out << "        \"big_endian\": " << (signal.bigEndian ? "true" : "false") << ",\n";
+    out << "        \"index\": " << signal.index << ",\n";
+    out << "        \"length\": " << signal.length << ",\n";
+    out << "        \"variables\": {\n";
+    out << "          \"v0\": {\n";
+    out << "            \"index\": " << signal.index << ",\n";
+    out << "            \"length\": " << signal.length << '\n';
+    out << "          }\n";
+    out << "        },\n";
+    writeJsonStringProperty(out, "source", signal.source);
+    writeJsonStringProperty(out, "object", signal.object);
+    writeJsonStringProperty(out, "formula", signal.formula, signal.senderId.has_value());
+    if (signal.key == "mileage") {
+        out << "        \"comment\": \"Signal name in PDX: " << jsonEscape(signal.object) << "\",\n";
+    }
+    if (signal.senderId) {
+        out << "        \"sender_id\": " << *signal.senderId << ",\n";
+        out << "        \"receiver_id\": " << *signal.receiverId << '\n';
+    }
+    out << "      }";
+    if (comma) {
+        out << ',';
+    }
+    out << '\n';
 }
 
 void writeRawExpression(std::ostream& out, int bytePosition, int byteCount) {
@@ -764,6 +1186,47 @@ void writeInteractiveValueFindings(std::istream& in,
 
         out << '\n' << matches[static_cast<std::size_t>(*selected - 1)]->details;
     }
+}
+
+void writeMosdonConfig(std::ostream& out,
+    const std::vector<RawDocument>& documents,
+    const std::vector<ValueQuery>& queries,
+    const MosdonConfigOptions& options) {
+    const auto signals = collectMosdonConfigSignals(out, documents, queries, options);
+
+    out << "{\n";
+    out << "  \"vehicle\": {\n";
+    out << "    \"manufacturer\": \"" << jsonEscape(options.manufacturer) << "\",\n";
+    out << "    \"model\": \"" << jsonEscape(options.model) << "\",\n";
+    out << "    \"version\": \"" << jsonEscape(options.version) << "\",\n";
+    out << "    \"fuel_tank_capacity_liters\": \"" << jsonEscape(options.fuelTankCapacityLiters) << "\"\n";
+    out << "  },\n";
+    out << "  \"can\": {\n";
+    out << "    \"protocols\": {\n";
+    out << "      \"uds\": {\n";
+    out << "        \"allow\": true\n";
+    out << "      },\n";
+    out << "      \"obd\": {\n";
+    out << "        \"extended_id\": false,\n";
+    out << "        \"response_ids\": [\n";
+    out << "          2024,\n";
+    out << "          2025,\n";
+    out << "          2026,\n";
+    out << "          2027,\n";
+    out << "          2028,\n";
+    out << "          2029,\n";
+    out << "          2030,\n";
+    out << "          2031\n";
+    out << "        ]\n";
+    out << "      }\n";
+    out << "    },\n";
+    out << "    \"signals\": {\n";
+    for (std::size_t i = 0; i < signals.size(); ++i) {
+        writeSignal(out, signals[i], i + 1 < signals.size());
+    }
+    out << "    }\n";
+    out << "  }\n";
+    out << "}\n";
 }
 
 }

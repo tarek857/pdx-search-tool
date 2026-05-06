@@ -14,6 +14,8 @@ struct ProgramOptions
     std::string output;
     std::string searchQuery;
     std::vector<pdxinfo::ValueQuery> valueQueries;
+    pdxinfo::MosdonConfigOptions mosdonConfig;
     int contextLines = 2;
     bool interactive = false;
+    bool mosdonConfigOutput = false;
 };
