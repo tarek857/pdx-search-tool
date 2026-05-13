@@ -1,4 +1,6 @@
 build/
 *.pdx
 *.zip
-
+pdx
+config
+.codex
